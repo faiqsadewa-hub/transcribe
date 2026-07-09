@@ -114,6 +114,7 @@ class WhisperONNX:
         tokens = list(initial)
         logits, kv = self.dec_step([tokens], audio_features, kv, 0)
         seq = []
+        sum_logprob = 0.0
         max_ts = TS_BEGIN  # monotonicity floor
         rng = np.random.default_rng(0)
         for step in range(max_tokens):
@@ -147,13 +148,16 @@ class WhisperONNX:
                 p[~np.isfinite(p)] = 0
                 p /= p.sum()
                 nxt = int(rng.choice(len(p), p=p))
+            # accumulate logprob of the chosen token (over unmasked dist)
+            sum_logprob += float(np.log(probs[nxt] + 1e-12))
             if nxt == EOT:
                 break
             seq.append(nxt)
             if nxt >= TS_BEGIN:
                 max_ts = max(max_ts, nxt)
             logits, kv = self.dec_step([[nxt]], audio_features, kv, len(initial) + len(seq) - 1)
-        return seq
+        avg_logprob = sum_logprob / max(1, len(seq) + 1)
+        return seq, avg_logprob
 
     def transcribe(self, audio, lang="id", log=print):
         segments = []
@@ -166,13 +170,19 @@ class WhisperONNX:
                 chunk = np.pad(chunk, (0, N_AUDIO_PER_WINDOW - len(chunk)))
             mel = log_mel(chunk)[:, :N_FRAMES]
             af = self.encode(mel)
-            seq = self.decode_window(af, lang)
-            # detect degenerate repetition -> retry with sampling
-            text_tokens_all = [t for t in seq if t < EOT]
-            if len(text_tokens_all) > 30:
-                tail = text_tokens_all[-30:]
-                if len(set(tail)) <= 4:
-                    seq = self.decode_window(af, lang, temperature=0.4)
+            # whisper-style temperature fallback on low confidence / degenerate output
+            import zlib
+            seq = []
+            for temp in (0.0, 0.2, 0.4, 0.6, 0.8):
+                seq, avg_lp = self.decode_window(af, lang, temperature=temp)
+                text_tokens_all = [t for t in seq if t < EOT]
+                txt = self.tok.decode(text_tokens_all)
+                comp_ratio = (len(txt.encode()) / max(1, len(zlib.compress(txt.encode())))) if txt else 0.0
+                degenerate = comp_ratio > 2.4 or avg_lp < -1.0
+                if len(text_tokens_all) > 30 and len(set(text_tokens_all[-30:])) <= 4:
+                    degenerate = True
+                if not degenerate:
+                    break
             # parse <|t0|> text <|t1|> pairs
             base_t = seek / SAMPLE_RATE
             i = 0
@@ -227,15 +237,16 @@ if __name__ == "__main__":
     ap.add_argument("audio"); ap.add_argument("out")
     ap.add_argument("--lang", default="id")
     ap.add_argument("--model", default="small", choices=["small", "medium"])
+    ap.add_argument("--enc"); ap.add_argument("--dec")
     ap.add_argument("--start", type=float); ap.add_argument("--dur", type=float)
     a = ap.parse_args()
 
     audio = load_audio(a.audio, a.start, a.dur)
     print(f"audio: {len(audio)/16000:.0f}s; loading model...", flush=True)
     if a.model == "medium":
-        model = WhisperONNX(S / "encoder_medium.onnx", S / "decoder_medium_fix_kv_cache.onnx", kv_layers=48, n_state=1024)
+        model = WhisperONNX(a.enc or S / "encoder_medium.onnx", a.dec or S / "decoder_medium_fix_kv_cache.onnx", kv_layers=48, n_state=1024)
     else:
-        model = WhisperONNX(S / "encoder_small.onnx", S / "decoder_small_fix_kv_cache.onnx")
+        model = WhisperONNX(a.enc or S / "encoder_small.onnx", a.dec or S / "decoder_small_fix_kv_cache.onnx")
     t0 = time.time()
     segs = model.transcribe(audio, lang=a.lang)
     el = time.time() - t0
