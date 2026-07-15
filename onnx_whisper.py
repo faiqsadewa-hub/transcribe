@@ -159,7 +159,7 @@ class WhisperONNX:
         avg_logprob = sum_logprob / max(1, len(seq) + 1)
         return seq, avg_logprob
 
-    def transcribe(self, audio, lang="id", log=print):
+    def transcribe(self, audio, lang="id", log=print, on_segment=None):
         segments = []
         seek = 0  # samples
         n = len(audio)
@@ -207,6 +207,8 @@ class WhisperONNX:
             segments.extend(window_segments)
             for s in window_segments:
                 log(f"  [{s[0]:7.1f}s] {s[2][:100]}")
+                if on_segment:
+                    on_segment(s)
             # advance: by last timestamp if meaningful, else full window
             if last_ts_val > 1.0 and seek + N_AUDIO_PER_WINDOW < n:
                 seek += int(last_ts_val * SAMPLE_RATE)
@@ -238,9 +240,20 @@ if __name__ == "__main__":
     ap.add_argument("--lang", default="id")
     ap.add_argument("--model", default="small", choices=["small", "medium"])
     ap.add_argument("--enc"); ap.add_argument("--dec")
+    ap.add_argument("--resume", action="store_true")
     ap.add_argument("--start", type=float); ap.add_argument("--dur", type=float)
     a = ap.parse_args()
 
+    ap2 = a
+    resume_sec = 0.0
+    if getattr(a, "resume", False) and Path(a.out).exists():
+        import re as _re
+        txt = Path(a.out).read_text(encoding="utf-8")
+        ts = _re.findall(r"\((?:(\d+):)?(\d+):(\d+) - (?:(\d+):)?(\d+):(\d+)\)", txt)
+        if ts:
+            h, m, s2 = ts[-1][3] or "0", ts[-1][4], ts[-1][5]
+            resume_sec = int(h)*3600 + int(m)*60 + int(s2)
+            print(f"resuming from {resume_sec:.0f}s", flush=True)
     audio = load_audio(a.audio, a.start, a.dur)
     print(f"audio: {len(audio)/16000:.0f}s; loading model...", flush=True)
     if a.model == "medium":
@@ -248,12 +261,17 @@ if __name__ == "__main__":
     else:
         model = WhisperONNX(a.enc or S / "encoder_small.onnx", a.dec or S / "decoder_small_fix_kv_cache.onnx")
     t0 = time.time()
-    segs = model.transcribe(audio, lang=a.lang)
-    el = time.time() - t0
-    with open(a.out, "w", encoding="utf-8") as f:
+    mode = "a" if resume_sec > 0 else "w"
+    f = open(a.out, mode, encoding="utf-8")
+    if mode == "w":
         f.write(f"Transcript: {Path(a.audio).name}\n")
         f.write(f"Generated: {time.strftime('%Y-%m-%d %H:%M:%S')} (whisper-{a.model} multilingual, ONNX)\n")
         f.write("=" * 60 + "\n\n")
-        for t0s, t1s, txt in segs:
-            f.write(f"({fmt(t0s)} - {fmt(t1s)})\n{txt}\n\n")
-    print(f"done in {el:.1f}s ({len(audio)/16000/el:.2f}x realtime), {len(segs)} segments -> {a.out}")
+        f.flush()
+    def emit(s, _f=f, _off=resume_sec):
+        t0s, t1s, txt = s
+        _f.write(f"({fmt(t0s+_off)} - {fmt(t1s+_off)})\n{txt}\n\n"); _f.flush()
+    segs = model.transcribe(audio[int(resume_sec*16000):], lang=a.lang, on_segment=emit)
+    f.close()
+    el = time.time() - t0
+    print(f"done in {el:.1f}s, {len(segs)} segments -> {a.out}")
