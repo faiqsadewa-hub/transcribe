@@ -1,0 +1,10 @@
+# Model weights (downloaded/provided at runtime)
+models/
+*.bin
+
+# Generated transcripts
+*.txt
+
+# Python cache
+__pycache__/
+*.pyc
